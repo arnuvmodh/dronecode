@@ -27,7 +27,7 @@ DRONE_IP = "192.168.42.1"
 AUDIO_FOLDER = "./audio"
 MODEL_PATH = "yolov8n.pt"
 
-COOLDOWN_SECONDS = 30
+COOLDOWN_SECONDS = 20
 HOVER_TIME = 0.5
 MAX_AIR_TIME = 2.0
 TAKEOFF_TIMEOUT = 12.0
@@ -40,6 +40,11 @@ DETECTION_CONF = 0.35
 FRAME_STALE_SECONDS = 0.75
 STARTUP_ARM_DELAY = 2.0
 WATCHDOG_PERIOD = 0.1
+
+# Detection behavior for busy scenes
+DETECTION_INTERVAL = 0.05
+PERSON_HOLD_SECONDS = 0.20
+PERSON_LOST_GRACE_SECONDS = 0.40
 
 
 # ================= SHARED STATE =================
@@ -54,6 +59,8 @@ shutdown_event = Event()
 
 is_flying = False
 person_present = False
+person_seen_since = None
+last_person_detected_time = 0.0
 last_flight_time = -COOLDOWN_SECONDS
 flight_disabled = False
 flight_start_time = None
@@ -144,6 +151,91 @@ def system_is_armed():
     return (time.time() - system_armed_time) >= STARTUP_ARM_DELAY
 
 
+def cooldown_remaining():
+    remaining = COOLDOWN_SECONDS - (time.time() - last_flight_time)
+    return max(0.0, remaining)
+
+
+def can_trigger_now():
+    now = time.time()
+    with state_lock:
+        person_held_long_enough = (
+            person_seen_since is not None and
+            (now - person_seen_since) >= PERSON_HOLD_SECONDS
+        )
+
+        cooldown_elapsed = (now - last_flight_time) > COOLDOWN_SECONDS
+
+        return (
+            window_ready
+            and system_is_armed()
+            and frame_is_fresh()
+            and person_present
+            and person_held_long_enough
+            and not is_flying
+            and not flight_disabled
+            and cooldown_elapsed
+        )
+
+
+def draw_status_overlay(frame):
+    try:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (420, 170), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
+
+        now = time.time()
+        fresh = frame_is_fresh()
+        armed = system_is_armed()
+        airborne = is_airborne_state()
+        ready = can_trigger_now()
+        cooldown_left = cooldown_remaining()
+
+        with state_lock:
+            local_person_present = person_present
+            local_is_flying = is_flying
+            local_disabled = flight_disabled
+
+        lines = [
+            f"VIDEO: {'OK' if current_frame is not None else 'WAITING'}",
+            f"FRESH: {'YES' if fresh else 'NO'}",
+            f"ARMED: {'YES' if armed else 'NO'}",
+            f"PERSON: {'YES' if local_person_present else 'NO'}",
+            f"FLYING: {'YES' if local_is_flying or airborne else 'NO'}",
+            f"COOLDOWN: {cooldown_left:.1f}s",
+            f"READY: {'YES' if ready else 'NO'}",
+            f"LOCKED: {'YES' if local_disabled else 'NO'}",
+        ]
+
+        y = 35
+        for line in lines:
+            color = (0, 255, 0)
+            if "NO" in line or "WAITING" in line:
+                color = (0, 200, 255)
+            if line.startswith("READY: YES"):
+                color = (0, 255, 0)
+            if line.startswith("LOCKED: YES"):
+                color = (0, 0, 255)
+
+            cv2.putText(
+                frame,
+                line,
+                (20, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+            y += 18
+
+        return frame
+
+    except Exception as e:
+        print(f"[OVERLAY] Error: {e}")
+        return frame
+
+
 def play_random_audio():
     try:
         files = [f for f in os.listdir(AUDIO_FOLDER) if f.lower().endswith(".wav")]
@@ -189,7 +281,7 @@ def try_land(reason="unspecified", retries=3, wait_between=0.75):
 
 # ================= STREAMING CALLBACK =================
 def on_raw_frame(yuv_frame):
-    global current_frame, last_frame_time
+    global current_frame, annotated_frame, last_frame_time
 
     try:
         info = yuv_frame.info()
@@ -201,6 +293,11 @@ def on_raw_frame(yuv_frame):
         bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
 
         current_frame = bgr
+
+        if annotated_frame is None:
+            base = cv2.resize(bgr, (640, 480))
+            annotated_frame = draw_status_overlay(base)
+
         last_frame_time = time.time()
 
     except Exception as e:
@@ -252,9 +349,9 @@ def telemetry_loop():
         " ",
         "ts",
         "flying_state",
-        "altitude_m",   # name reverted
+        "altitude_m",
         "battery_pct",
-        "vz",           # name reverted
+        "vz",
         "is_flying_flag",
         "person_present_flag",
         "flight_disabled_flag",
@@ -278,7 +375,6 @@ def telemetry_loop():
                 else "unknown"
             )
 
-            # STILL IN CM (only name changed back)
             altitude_m = safe_float(
                 alt if isinstance(alt, dict) else {},
                 "altitude",
@@ -291,7 +387,6 @@ def telemetry_loop():
                 0
             )
 
-            # STILL IN CM/S (only name changed back)
             _, _, vz = extract_speed(spd if isinstance(spd, dict) else {})
             vz = vz * 100.0
 
@@ -413,7 +508,8 @@ def flight_sequence():
             raise RuntimeError("Landing could not be confirmed")
 
         airborne = False
-        last_flight_time = time.time()
+        with state_lock:
+            last_flight_time = time.time()
         print("[FLIGHT] Completed successfully")
 
     except Exception as e:
@@ -442,7 +538,7 @@ def flight_sequence():
 model = YOLO(MODEL_PATH)
 
 def detection_loop():
-    global annotated_frame, person_present
+    global annotated_frame, person_present, person_seen_since, last_person_detected_time
 
     while not shutdown_event.is_set():
         frame = current_frame
@@ -455,34 +551,51 @@ def detection_loop():
             results = model(resized, classes=[0], conf=DETECTION_CONF, verbose=False)
 
             annotated = results[0].plot()
-            annotated_frame = cv2.resize(annotated, (640, 480))
+            annotated = cv2.resize(annotated, (640, 480))
 
-            detected = any(
+            detected_now = any(
                 model.names[int(cls)] == "person"
                 for r in results
                 for cls in r.boxes.cls
             )
 
             now = time.time()
-
             start_flight = False
+
             with state_lock:
+                if detected_now:
+                    last_person_detected_time = now
+                    if person_seen_since is None:
+                        person_seen_since = now
+                else:
+                    if (now - last_person_detected_time) > PERSON_LOST_GRACE_SECONDS:
+                        person_seen_since = None
+
+                person_present = (now - last_person_detected_time) <= PERSON_LOST_GRACE_SECONDS
+
+                person_held_long_enough = (
+                    person_seen_since is not None and
+                    (now - person_seen_since) >= PERSON_HOLD_SECONDS
+                )
+
+                cooldown_elapsed = (now - last_flight_time) > COOLDOWN_SECONDS
+
                 can_trigger = (
                     window_ready
                     and system_is_armed()
                     and frame_is_fresh()
-                    and not person_present
+                    and person_present
+                    and person_held_long_enough
                     and not is_flying
                     and not flight_disabled
-                    and now - last_flight_time > COOLDOWN_SECONDS
+                    and cooldown_elapsed
                 )
 
-                if detected:
-                    if can_trigger:
-                        start_flight = True
-                    person_present = True
-                else:
-                    person_present = False
+                if can_trigger:
+                    start_flight = True
+                    person_seen_since = now
+
+            annotated_frame = draw_status_overlay(annotated)
 
             if start_flight:
                 Thread(target=flight_sequence, daemon=False).start()
@@ -490,7 +603,7 @@ def detection_loop():
         except Exception as e:
             print(f"[DETECTION] Error: {e}")
 
-        time.sleep(0.03)
+        time.sleep(DETECTION_INTERVAL)
 
 
 # ================= MAIN =================

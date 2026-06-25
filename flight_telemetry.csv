@@ -1,0 +1,2 @@
+ ,ts,flying_state,altitude_cm,battery_pct,vz_cm_s,is_flying_flag,person_present_flag,flight_disabled_flag
+1,1775500987.897845,FlyingStateChanged_State.landed,0.0,88,0.0,0,1,0
